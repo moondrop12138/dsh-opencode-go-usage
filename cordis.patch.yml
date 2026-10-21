@@ -1,0 +1,11 @@
+# dsh-opencode-go-usage bundle: DSH bundle entry point.
+# Mounts the OpenCode Go subscription usage page.
+# Host half polls the official usage endpoint with the DSH-stored
+# OPENCODE_GO_API_KEY, keeps a 7-day local sample trail, and serves the summary
+# over its own authenticated Fetch RPC route
+# (POST /api/dsh-opencode-go-usage/call); the Client half registers a
+# left-sidebar panel entry (order 30) plus the matching keyed `main` page.
+
+- insert:
+    - id: opencode-go-usage
+      name: 'dsh-opencode-go-usage'

@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenCode Go 用量 · 视觉预览</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { background: #f5f3ee; color: #1d1b16; overflow: hidden; }
+    body[data-ds-dark-theme] { background: #24221f; color: #f0ece4; }
+    #root { height: 100%; }
+    #boot {
+      position: fixed; left: 50%; bottom: 18px; z-index: 20;
+      display: flex; align-items: center; gap: 8px;
+      transform: translateX(-50%);
+      padding: 7px 12px; border-radius: 999px;
+      border: 1px solid #e3ddd1; background: #faf8f3;
+      font: 11px/1.4 "SF Mono", Consolas, monospace; color: #7f7869;
+      box-shadow: 0 4px 18px rgba(29, 27, 22, .08);
+    }
+    body[data-ds-dark-theme] #boot { border-color: #3a352e; background: #2b2824; color: #a49c8d; }
+    #boot[hidden] { display: none; }
+    .boot-dot { width: 5px; height: 5px; border-radius: 50%; background: #da7756; animation: boot-pulse 1.4s ease-in-out infinite; }
+    @keyframes boot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+    #boot-error {
+      position: fixed; z-index: 30; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      width: min(560px, calc(100vw - 40px));
+      padding: 26px 28px; border: 1px solid #b4552f; border-left-width: 4px;
+      border-radius: 10px; background: #faf8f3; color: #1d1b16;
+      box-shadow: 0 18px 60px rgba(29, 27, 22, .16);
+      font: 13px/1.65 "思源宋体 VF", "Source Han Serif", "Noto Serif SC", serif;
+    }
+    body[data-ds-dark-theme] #boot-error { background: #2b2824; color: #f0ece4; border-color: #d4775a; }
+    #boot-error[hidden] { display: none; }
+    #boot-error .kicker { font: 9px/1.4 "SF Mono", Consolas, monospace; letter-spacing: .22em; text-transform: uppercase; color: #b4552f; }
+    #boot-error h1 { margin: 4px 0 8px; font-size: 20px; font-weight: 600; }
+    #boot-error p { margin: 0 0 10px; color: #7f7869; font-size: 12.5px; }
+    body[data-ds-dark-theme] #boot-error p { color: #a49c8d; }
+    #boot-error code { font: 11px/1.5 "SF Mono", Consolas, monospace; padding: 1px 5px; border-radius: 4px; background: #ece7dd; color: #1d1b16; }
+    body[data-ds-dark-theme] #boot-error code { background: #3a352e; color: #f0ece4; }
+    #boot-error pre { margin: 10px 0 0; padding: 9px 11px; border-radius: 6px; background: #ece7dd; color: #7f7869; font: 10px/1.55 "SF Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: auto; }
+    body[data-ds-dark-theme] #boot-error pre { background: #24221f; color: #a49c8d; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <div id="boot" role="status" aria-live="polite">
+    <span class="boot-dot" aria-hidden="true"></span>
+    <span id="boot-status">正在加载 OpenCode Go 预览…</span>
+  </div>
+
+  <div id="boot-error" hidden role="alert">
+    <div class="kicker">PREVIEW BOOT</div>
+    <h1>预览加载失败</h1>
+    <p id="boot-error-message"></p>
+    <p id="boot-error-hint"></p>
+    <pre id="boot-error-detail"></pre>
+  </div>
+
+  <script>
+    (function () {
+      'use strict'
+
+      var params = new URLSearchParams(window.location.search)
+      var state = params.get('state') || 'ready'
+      var lang = params.get('lang') === 'en' ? 'en' : 'zh'
+      var dark = params.get('dark') === '1'
+      var forceLocal = params.get('local') === '1'
+
+      window.__PREVIEW_READY__ = false
+      window.__PREVIEW_ERRORS__ = []
+      window.__PREVIEW_SOURCE__ = ''
+
+      if (dark) {
+        document.body.setAttribute('data-ds-dark-theme', '')
+        document.documentElement.style.colorScheme = 'dark'
+      }
+
+      function pushError(message) {
+        window.__PREVIEW_ERRORS__.push(String(message))
+      }
+
+      window.addEventListener('error', function (event) {
+        pushError(event.message || 'script error')
+      })
+      window.addEventListener('unhandledrejection', function (event) {
+        pushError(event.reason && event.reason.message ? event.reason.message : String(event.reason))
+      })
+
+      var boot = document.getElementById('boot')
+      var bootStatus = document.getElementById('boot-status')
+      var bootError = document.getElementById('boot-error')
+      var errorMessage = document.getElementById('boot-error-message')
+      var errorHint = document.getElementById('boot-error-hint')
+      var errorDetail = document.getElementById('boot-error-detail')
+
+      function fail(message, hint, detail) {
+        boot.hidden = true
+        bootError.hidden = false
+        errorMessage.textContent = message || '预览无法启动。'
+        errorHint.textContent = hint || '请检查网络，或在插件目录运行 node tools/render-preview.mjs（会自动准备本地 React 回退）。'
+        errorDetail.textContent = detail || ''
+        document.body.setAttribute('data-preview-error', 'true')
+      }
+
+      function loadScript(src) {
+        return new Promise(function (resolve, reject) {
+          var tag = document.createElement('script')
+          tag.src = src
+          tag.async = false
+          tag.onload = function () { resolve(src) }
+          tag.onerror = function () {
+            tag.parentNode && tag.parentNode.removeChild(tag)
+            reject(new Error('failed to load ' + src))
+          }
+          document.head.appendChild(tag)
+        })
+      }
+
+      function loadFirst(candidates) {
+        var index = 0
+        var failures = []
+        function next() {
+          if (index >= candidates.length) {
+            return Promise.reject(new Error(failures.join('\n') || 'no candidates'))
+          }
+          var source = candidates[index]
+          index += 1
+          return loadScript(source).then(function () {
+            return source
+          }, function (error) {
+            failures.push(error.message)
+            return next()
+          })
+        }
+        return next()
+      }
+
+      var REACT_CDN = 'https://unpkg.com/react@18.3.1/umd/react.production.min.js'
+      var REACT_DOM_CDN = 'https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js'
+      var REACT_LOCAL = './node_modules/react/umd/react.production.min.js'
+      var REACT_DOM_LOCAL = './node_modules/react-dom/umd/react-dom.production.min.js'
+      var REACT_LOCAL_UP = '../node_modules/react/umd/react.production.min.js'
+      var REACT_DOM_LOCAL_UP = '../node_modules/react-dom/umd/react-dom.production.min.js'
+
+      function buildTranslator(dictionary) {
+        return function (key, vars) {
+          var template = Object.prototype.hasOwnProperty.call(dictionary, key) ? dictionary[key] : key
+          if (!vars) return template
+          return String(template).replace(/\{(\w+)\}/g, function (match, name) {
+            return Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : match
+          })
+        }
+      }
+
+      function round1(value) {
+        return Math.round(value * 10) / 10
+      }
+
+      function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value))
+      }
+
+      var PERIOD = { rolling: 5 * 3600, weekly: 7 * 86400, monthly: 30 * 86400 }
+      var REMAINING = { rolling: 6800, weekly: 4 * 86400, monthly: 12 * 86400 }
+      var USED = { rolling: 12, weekly: 16, monthly: 10 }
+      // The demo trail is a 7-day history with a real recent slope: the weekly
+      // window reset 3 days ago and the monthly window is 18 days in. The
+      // pacing forecast fits the last 24 h of these samples, so it must not be
+      // confused with a reset-time extrapolation (which read ~224% weekly).
+      var WEEKLY_RESET_MS = 3 * 86400 * 1000
+      var MONTHLY_ELAPSED_MS = 18 * 86400 * 1000
+
+      function buildSamples(now) {
+        var stepMs = 3 * 3600 * 1000
+        var count = 57 // 7 days at 3-hour spacing; the last point is "now"
+        var weeklyResetAt = now - WEEKLY_RESET_MS
+        var rollingElapsedFrac = (PERIOD.rolling - REMAINING.rolling) / PERIOD.rolling
+        var rollingCycleStart = now - rollingElapsedFrac * PERIOD.rolling * 1000
+        var list = []
+        for (var index = 0; index < count; index += 1) {
+          var t = now - (count - 1 - index) * stepMs
+          var age = now - t
+          var offset = (t - rollingCycleStart) / (PERIOD.rolling * 1000)
+          var phase = offset - Math.floor(offset)
+          var rolling = (USED.rolling / rollingElapsedFrac) * phase
+          var weekly
+          if (t < weeklyResetAt) {
+            weekly = 74 + 2.5 * Math.sin(index * 0.7)
+          } else {
+            weekly = USED.weekly * ((t - weeklyResetAt) / (now - weeklyResetAt))
+          }
+          var monthly = USED.monthly * Math.max(0, 1 - age / MONTHLY_ELAPSED_MS)
+          list.push({
+            t: Math.round(t),
+            rolling: round1(clamp(rolling, 0, 100)),
+            weekly: round1(clamp(weekly, 0, 100)),
+            monthly: round1(clamp(monthly, 0, 100)),
+          })
+        }
+        list[list.length - 1] = {
+          t: Math.round(now),
+          rolling: USED.rolling,
+          weekly: USED.weekly,
+          monthly: USED.monthly,
+        }
+        return list
+      }
+
+      function buildSummary(stateName, now) {
+        var empty = stateName === 'empty'
+        var partial = stateName === 'partial'
+        var windows = {}
+        Object.keys(PERIOD).forEach(function (key) {
+          if (partial && key === 'monthly') return
+          var remaining = empty ? PERIOD[key] : REMAINING[key]
+          windows[key] = {
+            key: key,
+            label: key === 'rolling' ? '5h' : key,
+            status: 'ok',
+            percent: empty ? 0 : USED[key],
+            resetAt: new Date(now + remaining * 1000).toISOString(),
+            resetInSec: remaining,
+          }
+        })
+        var samples = empty ? [] : buildSamples(now)
+        return {
+          fetchedAt: stateName === 'stale' ? now - 7 * 60 * 1000 : now - 12 * 1000,
+          cached: stateName === 'stale',
+          stale: stateName === 'stale',
+          error: stateName === 'stale'
+            ? {
+              code: 'network',
+              message: lang === 'en'
+                ? 'Preview: the last live refresh timed out, showing the cached summary'
+                : '预览：最近一次实时刷新超时，当前显示缓存数据',
+            }
+            : null,
+          source: {
+            baseUrl: 'https://opencode.ai',
+            usageUrl: 'https://opencode.ai/zen/go/v1/usage',
+            keyRef: 'OPENCODE_GO_API_KEY',
+            keyHint: '…A1b2',
+          },
+          windows: windows,
+          samples: samples,
+          sampledSince: samples.length > 0 ? samples[0].t : null,
+        }
+      }
+
+      function makeOutcome(stateName) {
+        if (stateName === 'loading') return new Promise(function () {})
+        if (stateName === 'error') {
+          return Promise.resolve({
+            ok: false,
+            error: {
+              code: 'no-key',
+              message: lang === 'en'
+                ? 'Preview: OPENCODE_GO_API_KEY is not configured'
+                : '预览：尚未配置 OPENCODE_GO_API_KEY',
+              details: { reason: 'preview' },
+            },
+          })
+        }
+        return Promise.resolve({ ok: true, value: buildSummary(stateName, Date.now()) })
+      }
+
+      var translator = null
+      var internals = null
+
+      function ready() {
+        if (window.__PREVIEW_READY__) return
+        window.__PREVIEW_READY__ = true
+        boot.hidden = true
+        document.body.setAttribute('data-preview-ready', 'true')
+      }
+
+      async function bootPreview() {
+        bootStatus.textContent = '正在加载 React 18…'
+        var reactCandidates = forceLocal ? [REACT_LOCAL, REACT_LOCAL_UP, REACT_CDN] : [REACT_CDN, REACT_LOCAL, REACT_LOCAL_UP]
+        var domCandidates = forceLocal ? [REACT_DOM_LOCAL, REACT_DOM_LOCAL_UP, REACT_DOM_CDN] : [REACT_DOM_CDN, REACT_DOM_LOCAL, REACT_DOM_LOCAL_UP]
+        var reactSource
+        var domSource
+        try {
+          reactSource = await loadFirst(reactCandidates)
+          domSource = await loadFirst(domCandidates)
+        } catch (error) {
+          fail(
+            '无法加载 React 18（CDN 与本地回退都不可用）。',
+            '请联网后重试，或在插件目录运行 node tools/render-preview.mjs；它会尝试 npm install --prefix tools react@18 react-dom@18 并使用本地 UMD。',
+            String(error && error.message ? error.message : error)
+          )
+          return
+        }
+        window.__PREVIEW_SOURCE__ = reactSource + ' + ' + domSource
+        if (!window.React || !window.ReactDOM) {
+          fail('React 18 已加载，但全局 React / ReactDOM 不存在。', '请确认加载的是 React 18 的 UMD 构建。', window.__PREVIEW_SOURCE__)
+          return
+        }
+
+        bootStatus.textContent = '正在加载客户端模块…'
+        window.__ModuleLoader__ = {
+          load: function (descriptor) {
+            window.__OGQ_MODULE__ = descriptor
+          },
+        }
+        try {
+          await loadScript('../lib/client.js')
+        } catch (error) {
+          fail('无法加载 ../lib/client.js。', '请从插件目录（dsh-opencode-go-usage/tools/）打开本页面。', String(error && error.message ? error.message : error))
+          return
+        }
+
+        var descriptor = window.__OGQ_MODULE__
+        if (!descriptor || typeof descriptor.factory !== 'function') {
+          fail('客户端模块没有通过 window.__ModuleLoader__ 注册。', '请检查 lib/client.js 的模块头。', '')
+          return
+        }
+        try {
+          var exported = descriptor.factory(function (id) {
+            if (id === 'react') return window.React
+            throw new Error('preview require: ' + id)
+          })
+          internals = exported.__internals
+        } catch (error) {
+          fail('客户端模块初始化失败。', '请检查 lib/client.js 的语法与工厂函数。', String(error && error.stack ? error.stack : error))
+          return
+        }
+        if (!internals || typeof internals.QuotaPage !== 'function' || typeof internals.PAGE_CSS !== 'string') {
+          fail('客户端模块没有暴露 QuotaPage / PAGE_CSS。', '请检查 __internals。', '')
+          return
+        }
+
+        translator = buildTranslator(internals.dictionaries[lang] || internals.dictionaries.zh)
+        document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN'
+
+        var style = document.createElement('style')
+        style.id = 'ogq-preview-css'
+        style.textContent = internals.PAGE_CSS
+        document.head.appendChild(style)
+
+        try {
+          var root = window.ReactDOM.createRoot(document.getElementById('root'))
+          root.render(window.React.createElement(internals.QuotaPage, {
+            t: translator,
+            requestSummary: function () { return makeOutcome(state) },
+            requestRefresh: function () { return makeOutcome(state) },
+          }))
+        } catch (error) {
+          fail('页面渲染失败。', '请检查 QuotaPage 的组件实现。', String(error && error.stack ? error.stack : error))
+          return
+        }
+
+        var settle = function () {
+          window.requestAnimationFrame(function () {
+            window.requestAnimationFrame(function () {
+              window.setTimeout(ready, 30)
+            })
+          })
+        }
+        if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') {
+          document.fonts.ready.then(settle, settle)
+        } else {
+          settle()
+        }
+      }
+
+      bootPreview().catch(function (error) {
+        fail('预览启动时发生未捕获错误。', '请查看下方错误详情。', String(error && error.stack ? error.stack : error))
+      })
+    })()
+  </script>
+</body>
+</html>
