@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "OpenCode Go 用量",
-    "description": "OpenCode Go 订阅用量：官方接口的 5 小时、每周、每月三档已用百分比与重置时间，附本地采样轨迹和节奏预测。"
+    "description": "OpenCode Go 订阅用量：官方接口的 5 小时、每周、每月三档已用百分比与重置时间，附本地采样轨迹、节奏预测，以及可切换的多账号。"
   }
 }

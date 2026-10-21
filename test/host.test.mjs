@@ -24,7 +24,19 @@ const {
   UsageError,
   UsageService,
   SampleStore,
+  AccountStore,
+  AccountService,
   sampleFilePath,
+  accountFilePath,
+  DEFAULT_ACCOUNT_ID,
+  MAX_ACCOUNTS,
+  normalizeApiKey,
+  keyFingerprint,
+  normalizeLabel,
+  newAccountId,
+  refForAccountId,
+  normalizeAccountId,
+  publicAccount,
   clampPercent,
   createDispatch,
   fetchGoUsage,
@@ -713,9 +725,9 @@ test('SampleStore appends, dedupes within 30s and persists atomically', (t) => {
   assert.equal(store.list().length, 2)
 
   const onDisk = JSON.parse(readFileSync(file, 'utf8'))
-  assert.equal(onDisk.version, 1)
-  assert.equal(onDisk.samples.length, 2)
-  assert.deepEqual(onDisk.samples, store.list())
+  assert.equal(onDisk.version, 2)
+  assert.equal(onDisk.accounts.default.samples.length, 2)
+  assert.deepEqual(onDisk.accounts.default.samples, store.list())
 
   const reloaded = new SampleStore({ file, now: () => clock })
   assert.deepEqual(reloaded.list(), store.list())
@@ -755,8 +767,8 @@ test('SampleStore recovers from a corrupt file and survives IO failure', (t) => 
   const store = new SampleStore({ file, now: () => 1_800_000_000_000 })
   assert.deepEqual(store.list(), [])
   const rewritten = JSON.parse(readFileSync(file, 'utf8'))
-  assert.equal(rewritten.version, 1)
-  assert.deepEqual(rewritten.samples, [])
+  assert.equal(rewritten.version, 2)
+  assert.deepEqual(rewritten.accounts, {})
 
   // A file where a directory is required: both load and save must stay silent.
   const blocker = join(dir, 'blocker')
@@ -848,9 +860,12 @@ test('UsageService builds the frozen Summary shape', async (t) => {
   const summary = result.value
   assert.deepEqual(
     Object.keys(summary).sort(),
-    ['cached', 'error', 'fetchedAt', 'sampledSince', 'samples', 'source', 'stale', 'windows'],
+    ['account', 'cached', 'error', 'fetchedAt', 'sampledSince', 'samples', 'source', 'stale', 'windows'],
   )
   assert.deepEqual(Object.keys(summary.source).sort(), ['baseUrl', 'keyHint', 'keyRef', 'usageUrl'])
+  assert.deepEqual(Object.keys(summary.account).sort(), ['id', 'isDefault', 'keyHint', 'keyRef', 'label'])
+  assert.equal(summary.account.id, 'default')
+  assert.equal(summary.account.isDefault, true)
   assert.deepEqual(Object.keys(summary.windows), ['rolling', 'weekly', 'monthly'])
   for (const key of ['rolling', 'weekly', 'monthly']) {
     assert.equal(summary.windows[key].key, key)
@@ -1244,4 +1259,363 @@ test('module identity matches the contract', () => {
   assert.equal(normalizeResult({ ok: true, value: 0 }).ok, true)
   assert.equal(normalizeResult({ ok: false }).error.details.constructor, Object)
   assert.equal(typeof UsageError, 'function')
+})
+
+/* ----------------------------------------------------------------- accounts */
+
+function makeAccountHarness(t, options = {}) {
+  const dir = tempDir(t)
+  let clock = options.now || 1_800_000_000_000
+  const vault = new Map(options.vault || [[KEY_REF, SECRET]])
+  const calls = []
+  let behavior = options.behavior || 'ok'
+  const settings = {
+    providers: {
+      'opencode-go': { apiKeyEnv: KEY_REF, baseURL: DEFAULT_BASE_URL },
+    },
+  }
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init })
+    if (behavior === 'network') throw new TypeError('fetch failed')
+    if (behavior === 'unauthorized') return new Response('', { status: 401 })
+    return jsonResponse(options.body || usageBody())
+  }
+  const ctx = {
+    get(service) {
+      if (service === 'credentials') {
+        return {
+          async resolve(ref) {
+            return vault.has(ref) ? { value: vault.get(ref), source: 'file' } : undefined
+          },
+          async set(ref, value) {
+            if (typeof value !== 'string' || value === '') throw new Error('empty')
+            vault.set(ref, value)
+          },
+          async unset(ref) {
+            vault.delete(ref)
+          },
+          async describe(ref) {
+            return { configured: vault.has(ref), writable: true }
+          },
+        }
+      }
+      if (service === 'settings') {
+        return { async get(ns) { return ns === 'llm-pi-ai' ? settings : undefined } }
+      }
+      return undefined
+    },
+  }
+  const store = new AccountStore({ file: join(dir, 'accounts.json'), now: () => clock })
+  const accountService = new AccountService({
+    ctx,
+    config: { apiKeyEnv: KEY_REF, baseUrl: DEFAULT_BASE_URL },
+    store,
+    fetchImpl,
+    timeoutMs: 1_000,
+    now: () => clock,
+    log: () => {},
+  })
+  const sampleStore = new SampleStore({ file: join(dir, 'samples.json'), now: () => clock })
+  const usage = new UsageService({
+    resolveAccount: (id) => accountService.resolveAccount(id),
+    fetchImpl,
+    store: sampleStore,
+    now: () => clock,
+    log: () => {},
+  })
+  const dispatch = createDispatch({ usage, accounts: accountService, samples: sampleStore })
+  return {
+    dir,
+    vault,
+    settings,
+    calls,
+    store,
+    accountService,
+    sampleStore,
+    usage,
+    dispatch,
+    setClock: (next) => { clock = next },
+    advance: (ms) => { clock += ms },
+    get clock() { return clock },
+    setBehavior: (next) => { behavior = next },
+  }
+}
+
+test('normalizeApiKey trims, drops one Bearer prefix and rejects bad shapes', () => {
+  assert.deepEqual(normalizeApiKey('  Bearer oc_sk_abcdefgh  '), { ok: true, value: 'oc_sk_abcdefgh' })
+  assert.equal(normalizeApiKey('short').ok, false)
+  assert.equal(normalizeApiKey('oc sk with space').ok, false)
+  assert.equal(normalizeApiKey('').ok, false)
+  assert.equal(normalizeApiKey(null).ok, false)
+  assert.equal(normalizeApiKey('x'.repeat(600)).ok, false)
+  const bearer = normalizeApiKey('bearer oc_sk_abcdefgh')
+  assert.equal(bearer.ok, true)
+  assert.equal(bearer.value, 'oc_sk_abcdefgh')
+})
+
+test('account ids and refs follow the frozen grammar', () => {
+  const id = newAccountId()
+  assert.match(id, /^acc-[a-z0-9]{8}$/)
+  assert.equal(refForAccountId(id), 'OPENCODE_GO_USAGE_ACC_' + id.slice(4).toUpperCase())
+  assert.equal(normalizeAccountId('default'), 'default')
+  assert.equal(normalizeAccountId(id), id)
+  assert.throws(() => normalizeAccountId('nope'), /Unknown account/)
+  assert.equal(normalizeLabel('  工作号  '), '工作号')
+  assert.equal(normalizeLabel('x'.repeat(80)).length, 40)
+  assert.equal(keyFingerprint('oc_sk_abcdefgh').length, 16)
+  assert.notEqual(keyFingerprint('a'), keyFingerprint('b'))
+})
+
+test('AccountStore persists metadata, renames, activates and enforces the cap', (t) => {
+  const dir = tempDir(t)
+  const file = join(dir, 'accounts.json')
+  const store = new AccountStore({ file, maxAccounts: 2, now: () => 1_800_000_000_000 })
+  const first = store.add({ label: '主号' })
+  assert.equal(first.label, '主号')
+  store.setActive(first.id)
+  store.save()
+
+  const reloaded = new AccountStore({ file, maxAccounts: 2 })
+  assert.equal(reloaded.activeId, first.id)
+  assert.equal(reloaded.list()[0].ref, first.ref)
+
+  reloaded.rename(DEFAULT_ACCOUNT_ID, '默认')
+  assert.equal(reloaded.defaultLabel, '默认')
+  reloaded.rename(first.id, '新名字')
+  assert.equal(reloaded.get(first.id).label, '新名字')
+
+  assert.throws(() => reloaded.add({ label: '第三个' }), /at most 2 accounts/)
+  reloaded.remove(first.id)
+  assert.equal(reloaded.activeId, DEFAULT_ACCOUNT_ID)
+  assert.equal(reloaded.list().length, 0)
+})
+
+test('AccountStore recovers from a corrupt accounts file', (t) => {
+  const dir = tempDir(t)
+  const file = join(dir, 'accounts.json')
+  writeFileSync(file, '{ not json')
+  const store = new AccountStore({ file })
+  assert.deepEqual(store.list(), [])
+  assert.equal(store.activeId, DEFAULT_ACCOUNT_ID)
+  const rewritten = JSON.parse(readFileSync(file, 'utf8'))
+  assert.equal(rewritten.version, 1)
+  assert.deepEqual(rewritten.accounts, [])
+})
+
+test('AccountService adds an account, writes the key to credentials and activates it', async (t) => {
+  const harness = makeAccountHarness(t)
+  const second = 'oc_sk_second_account_C3d4'
+  const result = await harness.accountService.add({ label: '小号', apiKey: second })
+  assert.equal(result.account.label, '小号')
+  assert.equal(result.account.keyHint, '…C3d4')
+  assert.equal(result.warning, null)
+  assert.equal(harness.vault.get(result.account.keyRef), second)
+
+  const list = await harness.accountService.list()
+  assert.equal(list.accounts.length, 2)
+  assert.equal(list.activeId, result.account.id)
+  assert.equal(list.accounts[0].id, DEFAULT_ACCOUNT_ID)
+  assert.equal(list.accounts[1].configured, true)
+  assert.equal(list.accounts[1].keyHint, '…C3d4')
+
+  const summary = await harness.dispatch('summary', { accountId: result.account.id })
+  assert.equal(summary.ok, true)
+  assert.equal(summary.value.account.label, '小号')
+  assert.equal(summary.value.account.isDefault, false)
+  assert.equal(JSON.stringify(summary).includes(second), false)
+})
+
+test('AccountService rejects duplicate keys, bad keys and the account cap', async (t) => {
+  const harness = makeAccountHarness(t)
+  await assert.rejects(harness.accountService.add({ apiKey: SECRET }), /already configured/)
+  await assert.rejects(harness.accountService.add({ apiKey: 'short' }), /not valid/)
+  await assert.rejects(harness.accountService.add({ apiKey: 'has space here' }), /not valid/)
+
+  const cappedDir = join(harness.dir, 'capped')
+  const cappedStore = new AccountStore({ file: join(cappedDir, 'accounts.json'), maxAccounts: 2 })
+  const capped = new AccountService({
+    ctx: harness.accountService.ctx,
+    config: { apiKeyEnv: KEY_REF, baseUrl: DEFAULT_BASE_URL },
+    store: cappedStore,
+    fetchImpl: async () => jsonResponse(usageBody()),
+    timeoutMs: 1_000,
+    now: () => 1_800_000_000_000,
+    log: () => {},
+  })
+  await capped.add({ apiKey: 'oc_sk_first_C3d4' })
+  await assert.rejects(capped.add({ apiKey: 'oc_sk_second_D4e5' }), /at most 2 accounts/)
+})
+
+test('AccountService rolls back a 401 add and keeps a network add with a warning', async (t) => {
+  const harness = makeAccountHarness(t, { behavior: 'unauthorized' })
+  const before = new Map(harness.vault)
+  await assert.rejects(
+    harness.accountService.add({ apiKey: 'oc_sk_rejected_C3d4' }),
+    (error) => error.code === 'unauthorized',
+  )
+  assert.deepEqual(harness.vault, before)
+  assert.equal((await harness.accountService.list()).accounts.length, 1)
+
+  const net = makeAccountHarness(t, { behavior: 'network' })
+  const kept = await net.accountService.add({ apiKey: 'oc_sk_offline_C3d4' })
+  assert.equal(kept.warning.code, 'network')
+  assert.equal(kept.windows, null)
+  const listed = await net.accountService.list()
+  assert.equal(listed.accounts.length, 2)
+  assert.equal(listed.accounts[1].configured, true)
+})
+
+test('AccountService protects the default account and rotates custom keys', async (t) => {
+  const harness = makeAccountHarness(t)
+  await assert.rejects(
+    harness.accountService.update({ id: DEFAULT_ACCOUNT_ID, apiKey: 'oc_sk_other_C3d4' }),
+    (error) => error.code === 'default-key-managed',
+  )
+  await harness.accountService.update({ id: DEFAULT_ACCOUNT_ID, label: '主号' })
+  assert.equal((await harness.accountService.list()).accounts[0].label, '主号')
+  await assert.rejects(
+    harness.accountService.remove(DEFAULT_ACCOUNT_ID),
+    (error) => error.code === 'cannot-remove-default',
+  )
+
+  const added = await harness.accountService.add({ label: '小号', apiKey: 'oc_sk_first_C3d4' })
+  harness.setClock(harness.clock + 60_000)
+  const rotated = await harness.accountService.update({ id: added.account.id, apiKey: 'oc_sk_second_D4e5' })
+  assert.equal(rotated.changedKey, true)
+  assert.equal(harness.vault.get(added.account.keyRef), 'oc_sk_second_D4e5')
+})
+
+test('AccountService removes the key, the metadata and the sample bucket', async (t) => {
+  const harness = makeAccountHarness(t)
+  const added = await harness.accountService.add({ label: '小号', apiKey: 'oc_sk_second_C3d4' })
+  harness.sampleStore.append(added.account.id, { t: harness.clock, rolling: 1, weekly: 2, monthly: 3 }, 'fp')
+  assert.equal(harness.sampleStore.has(added.account.id), true)
+
+  const removed = await harness.dispatch('accounts.remove', { id: added.account.id })
+  assert.equal(removed.ok, true)
+  assert.equal(harness.vault.has(added.account.keyRef), false)
+  assert.equal(harness.sampleStore.has(added.account.id), false)
+  assert.equal(removed.value.activeId, DEFAULT_ACCOUNT_ID)
+})
+
+test('UsageService keeps caches, single-flight and samples per account', async (t) => {
+  const harness = makeAccountHarness(t)
+  const second = await harness.accountService.add({ label: '小号', apiKey: 'oc_sk_second_C3d4' })
+  harness.calls.length = 0
+
+  const [a, b] = await Promise.all([
+    harness.usage.get({ accountId: DEFAULT_ACCOUNT_ID }),
+    harness.usage.get({ accountId: DEFAULT_ACCOUNT_ID }),
+  ])
+  assert.equal(a.ok, true)
+  assert.equal(b.ok, true)
+  assert.equal(harness.calls.length, 1)
+
+  const custom = await harness.usage.get({ accountId: second.account.id })
+  assert.equal(custom.ok, true)
+  assert.equal(custom.value.account.id, second.account.id)
+  assert.equal(harness.calls.length, 2)
+  assert.equal(harness.calls[1].init.headers.Authorization, 'Bearer oc_sk_second_C3d4')
+
+  const again = await harness.usage.get({ accountId: DEFAULT_ACCOUNT_ID })
+  assert.equal(again.value.cached, true)
+  assert.equal(harness.calls.length, 2)
+
+  assert.equal(harness.sampleStore.list(DEFAULT_ACCOUNT_ID).length, 1)
+  assert.equal(harness.sampleStore.list(second.account.id).length, 1)
+})
+
+test('UsageService rejects unknown account ids without touching upstream', async (t) => {
+  const harness = makeAccountHarness(t)
+  harness.calls.length = 0
+  const result = await harness.usage.get({ accountId: 'acc-deadbeef' })
+  assert.equal(result.ok, false)
+  assert.equal(result.error.code, 'account-not-found')
+  assert.equal(harness.calls.length, 0)
+})
+
+test('accounts RPC endpoints return the contracted shapes', async (t) => {
+  const harness = makeAccountHarness(t)
+  const list = await harness.dispatch('accounts.list', {})
+  assert.equal(list.ok, true)
+  assert.equal(list.value.accounts.length, 1)
+  assert.equal(list.value.activeId, DEFAULT_ACCOUNT_ID)
+
+  const added = await harness.dispatch('accounts.add', { label: '小号', apiKey: 'oc_sk_second_C3d4' })
+  assert.equal(added.ok, true)
+  assert.equal(added.value.accounts.length, 2)
+  assert.equal(added.value.summary.account.label, '小号')
+  assert.equal(added.value.warning, null)
+
+  const renamed = await harness.dispatch('accounts.update', { id: added.value.activeId, label: '改名' })
+  assert.equal(renamed.ok, true)
+  assert.equal(renamed.value.summary, null)
+
+  const activated = await harness.dispatch('accounts.activate', { id: DEFAULT_ACCOUNT_ID })
+  assert.equal(activated.ok, true)
+  assert.equal(activated.value.activeId, DEFAULT_ACCOUNT_ID)
+
+  const removed = await harness.dispatch('accounts.remove', { id: added.value.activeId })
+  assert.equal(removed.ok, true)
+  assert.equal(removed.value.accounts.length, 1)
+
+  const unknown = await harness.dispatch('accounts.nope', {})
+  assert.equal(unknown.error.code, 'unknown-endpoint')
+})
+
+test('account error codes survive the RPC envelope', async (t) => {
+  const harness = makeAccountHarness(t)
+  const response = await handleRequest(new Request('http://local/api', {
+    method: 'POST',
+    body: JSON.stringify({
+      type: 'client-request',
+      rpcId: 'r1',
+      method: RPC_ENDPOINT,
+      payload: { endpoint: 'accounts.remove', payload: { id: 'acc-deadbeef' } },
+    }),
+  }), harness.dispatch)
+  const body = await response.json()
+  assert.equal(body.result.ok, false)
+  assert.equal(body.result.error.code, 'account-not-found')
+})
+
+test('sample buckets migrate from v1 and reset on a fingerprint change', (t) => {
+  const dir = tempDir(t)
+  const file = join(dir, 'samples.json')
+  writeFileSync(file, JSON.stringify({
+    version: 1,
+    updatedAt: 1,
+    samples: [{ t: 1_800_000_000_000, rolling: 1, weekly: 2, monthly: 3 }],
+  }))
+  const store = new SampleStore({ file, now: () => 1_800_000_000_000 })
+  assert.equal(store.list(DEFAULT_ACCOUNT_ID).length, 1)
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).version, 2)
+
+  store.append(DEFAULT_ACCOUNT_ID, { t: 1_800_000_000_000 + 60_000, rolling: 4, weekly: 5, monthly: 6 }, 'fp-one')
+  assert.equal(store.list(DEFAULT_ACCOUNT_ID, 'fp-one').length, 2)
+  assert.equal(store.list(DEFAULT_ACCOUNT_ID, 'fp-two').length, 0)
+  store.append(DEFAULT_ACCOUNT_ID, { t: 1_800_000_000_000 + 120_000, rolling: 7, weekly: 8, monthly: 9 }, 'fp-two')
+  assert.deepEqual(store.list(DEFAULT_ACCOUNT_ID, 'fp-two').map((point) => point.rolling), [7])
+})
+
+test('a key rotation clears the old bucket and cached values', async (t) => {
+  const harness = makeAccountHarness(t)
+  const added = await harness.accountService.add({ label: '小号', apiKey: 'oc_sk_first_C3d4' })
+  await harness.usage.get({ accountId: added.account.id })
+  assert.equal(harness.sampleStore.list(added.account.id, keyFingerprint('oc_sk_first_C3d4')).length, 1)
+
+  const rotated = await harness.dispatch('accounts.update', { id: added.account.id, apiKey: 'oc_sk_second_D4e5' })
+  assert.equal(rotated.ok, true)
+  assert.equal(harness.sampleStore.list(added.account.id, keyFingerprint('oc_sk_first_C3d4')).length, 0)
+  assert.equal(harness.sampleStore.list(added.account.id, keyFingerprint('oc_sk_second_D4e5')).length, 0)
+})
+
+test('account metadata never contains the key and accountFilePath stays under DSH_HOME', (t) => {
+  const harness = makeAccountHarness(t)
+  return harness.accountService.add({ label: 'x', apiKey: 'oc_sk_second_C3d4' }).then(() => {
+    const raw = readFileSync(join(harness.dir, 'accounts.json'), 'utf8')
+    assert.equal(raw.includes('oc_sk_second_C3d4'), false)
+    assert.ok(accountFilePath('C:/tmp/dsh-home').endsWith(join('opencode-go-usage', 'accounts.json')))
+    assert.equal(publicAccount({ id: DEFAULT_ACCOUNT_ID, keyRef: KEY_REF, keyHint: '…A1b2' }).keyHint, '…A1b2')
+  })
 })

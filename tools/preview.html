@@ -65,6 +65,7 @@
       var params = new URLSearchParams(window.location.search)
       var state = params.get('state') || 'ready'
       var lang = params.get('lang') === 'en' ? 'en' : 'zh'
+      var panelParam = params.get('panel') || ''
       var dark = params.get('dark') === '1'
       var forceLocal = params.get('local') === '1'
 
@@ -165,6 +166,21 @@
       var PERIOD = { rolling: 5 * 3600, weekly: 7 * 86400, monthly: 30 * 86400 }
       var REMAINING = { rolling: 6800, weekly: 4 * 86400, monthly: 12 * 86400 }
       var USED = { rolling: 12, weekly: 16, monthly: 10 }
+      // Demo accounts: the page ships with a default account plus two custom
+      // ones so the chip row, the manager and per-account switching are visible
+      // in screenshots. `panel=list|add` opens the manager for a still shot.
+      var PREVIEW_ACCOUNTS = [
+        { id: 'default', label: '', keyRef: 'OPENCODE_GO_API_KEY', keyHint: '…A1b2', isDefault: true, configured: true },
+        { id: 'acc-1a2b3c4d', label: '小号', keyRef: 'OPENCODE_GO_USAGE_ACC_1A2B3C4D', keyHint: '…C3d4', isDefault: false, configured: true },
+        { id: 'acc-5e6f7a8b', label: '工作号', keyRef: 'OPENCODE_GO_USAGE_ACC_5E6F7A8B', keyHint: '…E5f6', isDefault: false, configured: true },
+      ]
+      var USED_BY_ACCOUNT = {
+        default: USED,
+        'acc-1a2b3c4d': { rolling: 63, weekly: 22, monthly: 31 },
+        'acc-5e6f7a8b': { rolling: 7, weekly: 58, monthly: 44 },
+      }
+      var previewAccounts = PREVIEW_ACCOUNTS.slice()
+      var previewActive = 'default'
       // The demo trail is a 7-day history with a real recent slope: the weekly
       // window reset 3 days ago and the monthly window is 18 days in. The
       // pacing forecast fits the last 24 h of these samples, so it must not be
@@ -172,7 +188,7 @@
       var WEEKLY_RESET_MS = 3 * 86400 * 1000
       var MONTHLY_ELAPSED_MS = 18 * 86400 * 1000
 
-      function buildSamples(now) {
+      function buildSamples(now, used) {
         var stepMs = 3 * 3600 * 1000
         var count = 57 // 7 days at 3-hour spacing; the last point is "now"
         var weeklyResetAt = now - WEEKLY_RESET_MS
@@ -184,14 +200,14 @@
           var age = now - t
           var offset = (t - rollingCycleStart) / (PERIOD.rolling * 1000)
           var phase = offset - Math.floor(offset)
-          var rolling = (USED.rolling / rollingElapsedFrac) * phase
+          var rolling = (used.rolling / rollingElapsedFrac) * phase
           var weekly
           if (t < weeklyResetAt) {
             weekly = 74 + 2.5 * Math.sin(index * 0.7)
           } else {
-            weekly = USED.weekly * ((t - weeklyResetAt) / (now - weeklyResetAt))
+            weekly = used.weekly * ((t - weeklyResetAt) / (now - weeklyResetAt))
           }
-          var monthly = USED.monthly * Math.max(0, 1 - age / MONTHLY_ELAPSED_MS)
+          var monthly = used.monthly * Math.max(0, 1 - age / MONTHLY_ELAPSED_MS)
           list.push({
             t: Math.round(t),
             rolling: round1(clamp(rolling, 0, 100)),
@@ -201,16 +217,29 @@
         }
         list[list.length - 1] = {
           t: Math.round(now),
-          rolling: USED.rolling,
-          weekly: USED.weekly,
-          monthly: USED.monthly,
+          rolling: used.rolling,
+          weekly: used.weekly,
+          monthly: used.monthly,
         }
         return list
       }
 
-      function buildSummary(stateName, now) {
+      function accountById(id) {
+        for (var index = 0; index < previewAccounts.length; index += 1) {
+          if (previewAccounts[index].id === id) return previewAccounts[index]
+        }
+        return previewAccounts[0]
+      }
+
+      function accountsPayload() {
+        return { activeId: previewActive, accounts: previewAccounts.map(function (account) { return Object.assign({}, account) }) }
+      }
+
+      function buildSummary(stateName, now, account) {
         var empty = stateName === 'empty'
         var partial = stateName === 'partial'
+        var target = account || accountById(previewActive)
+        var used = USED_BY_ACCOUNT[target.id] || USED
         var windows = {}
         Object.keys(PERIOD).forEach(function (key) {
           if (partial && key === 'monthly') return
@@ -219,12 +248,12 @@
             key: key,
             label: key === 'rolling' ? '5h' : key,
             status: 'ok',
-            percent: empty ? 0 : USED[key],
+            percent: empty ? 0 : used[key],
             resetAt: new Date(now + remaining * 1000).toISOString(),
             resetInSec: remaining,
           }
         })
-        var samples = empty ? [] : buildSamples(now)
+        var samples = empty ? [] : buildSamples(now, used)
         return {
           fetchedAt: stateName === 'stale' ? now - 7 * 60 * 1000 : now - 12 * 1000,
           cached: stateName === 'stale',
@@ -240,8 +269,15 @@
           source: {
             baseUrl: 'https://opencode.ai',
             usageUrl: 'https://opencode.ai/zen/go/v1/usage',
-            keyRef: 'OPENCODE_GO_API_KEY',
-            keyHint: '…A1b2',
+            keyRef: target.keyRef,
+            keyHint: target.keyHint,
+          },
+          account: {
+            id: target.id,
+            label: target.label,
+            keyRef: target.keyRef,
+            keyHint: target.keyHint,
+            isDefault: target.isDefault,
           },
           windows: windows,
           samples: samples,
@@ -249,7 +285,7 @@
         }
       }
 
-      function makeOutcome(stateName) {
+      function makeOutcome(stateName, account) {
         if (stateName === 'loading') return new Promise(function () {})
         if (stateName === 'error') {
           return Promise.resolve({
@@ -263,7 +299,52 @@
             },
           })
         }
-        return Promise.resolve({ ok: true, value: buildSummary(stateName, Date.now()) })
+        return Promise.resolve({ ok: true, value: buildSummary(stateName, Date.now(), account) })
+      }
+
+      /** Preview-only account mutations: enough to exercise the panel by hand. */
+      function previewAdd(input) {
+        var key = input && typeof input.apiKey === 'string' ? input.apiKey.trim() : ''
+        if (key.length < 8) {
+          return Promise.resolve({ ok: false, error: { code: 'invalid-key', message: 'preview' } })
+        }
+        if (key === 'oc_sk_preview_rejected') {
+          return Promise.resolve({ ok: false, error: { code: 'unauthorized', message: 'preview' } })
+        }
+        var id = 'acc-' + Math.random().toString(16).slice(2, 10)
+        var account = {
+          id: id,
+          label: input && typeof input.label === 'string' && input.label.trim() !== '' ? input.label.trim() : '预览账号',
+          keyRef: 'OPENCODE_GO_USAGE_ACC_' + id.slice(4).toUpperCase(),
+          keyHint: '…' + key.slice(-4),
+          isDefault: false,
+          configured: true,
+        }
+        previewAccounts = previewAccounts.concat([account])
+        previewActive = id
+        return Promise.resolve({
+          ok: true,
+          value: { accounts: accountsPayload().accounts, activeId: id, summary: buildSummary('ready', Date.now(), account), warning: null },
+        })
+      }
+
+      function previewUpdate(input) {
+        var account = accountById(input && input.id)
+        if (account && input && typeof input.label === 'string') {
+          account.label = input.label.trim()
+        }
+        return Promise.resolve({ ok: true, value: { accounts: accountsPayload().accounts, activeId: previewActive, summary: null, warning: null } })
+      }
+
+      function previewRemove(id) {
+        previewAccounts = previewAccounts.filter(function (account) { return account.id !== id })
+        if (previewActive === id) previewActive = 'default'
+        return Promise.resolve({ ok: true, value: accountsPayload() })
+      }
+
+      function previewActivate(id) {
+        if (accountById(id) !== null) previewActive = id
+        return Promise.resolve({ ok: true, value: accountsPayload() })
       }
 
       var translator = null
@@ -344,8 +425,19 @@
           var root = window.ReactDOM.createRoot(document.getElementById('root'))
           root.render(window.React.createElement(internals.QuotaPage, {
             t: translator,
-            requestSummary: function () { return makeOutcome(state) },
-            requestRefresh: function () { return makeOutcome(state) },
+            requestSummary: function (accountId) {
+              previewActive = accountId || previewActive
+              return makeOutcome(state, accountById(previewActive))
+            },
+            requestRefresh: function (accountId) {
+              previewActive = accountId || previewActive
+              return makeOutcome(state, accountById(previewActive))
+            },
+            requestAccounts: function () { return Promise.resolve({ ok: true, value: accountsPayload() }) },
+            requestAddAccount: previewAdd,
+            requestUpdateAccount: previewUpdate,
+            requestRemoveAccount: previewRemove,
+            requestActivateAccount: previewActivate,
           }))
         } catch (error) {
           fail('页面渲染失败。', '请检查 QuotaPage 的组件实现。', String(error && error.stack ? error.stack : error))
@@ -355,7 +447,16 @@
         var settle = function () {
           window.requestAnimationFrame(function () {
             window.requestAnimationFrame(function () {
-              window.setTimeout(ready, 30)
+              window.setTimeout(function () {
+              if (panelParam === 'list') {
+                var manageBtn = document.querySelector('.ogq-manage')
+                if (manageBtn) manageBtn.click()
+              } else if (panelParam === 'add') {
+                var addBtn = document.querySelector('.ogq-chip-add')
+                if (addBtn) addBtn.click()
+              }
+              ready()
+            }, 30)
             })
           })
         }

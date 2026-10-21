@@ -138,6 +138,12 @@ test('module format: stable id, react-only require, inject/apply/__internals', (
     'readSummary',
     'readWindows',
     'readSamples',
+    'readAccount',
+    'readAccounts',
+    'accountLabel',
+    'accountErrorText',
+    'AccountBar',
+    'AccountPanel',
     'Dial',
     'Legend',
     'ForecastCard',
@@ -556,6 +562,13 @@ test('normalizeResult: value wins, data fallback, failure envelope is always val
   assert.equal(noWindows.ok, false)
   assert.equal(noWindows.error.code, 'bad-response')
 
+  const accountValue = { activeId: 'default', accounts: [] }
+  assert.deepEqual(
+    internals.normalizeResult({ ok: true, value: accountValue }, { any: true }),
+    { ok: true, value: accountValue },
+  )
+  assert.equal(internals.normalizeResult({ ok: true, value: accountValue }).ok, false)
+
   const failed = internals.normalizeResult({
     ok: false,
     error: { code: 'network', message: 'offline', details: { status: 503 } },
@@ -917,4 +930,219 @@ test('PAGE_CSS: themed tokens with warm fallbacks, dark + responsive + motion ru
   assert.ok(css.includes('font-variant-numeric:tabular-nums'))
   assert.ok(!css.includes('position:fixed'), 'the page must never cover the host shell')
   assert.ok(!css.includes('!important'))
+})
+
+/* ------------------------------------------------------------------ accounts */
+
+const ACCOUNTS = [
+  {
+    id: 'default', label: '', keyRef: 'OPENCODE_GO_API_KEY', keyHint: '…A1b2', isDefault: true, configured: true,
+  },
+  {
+    id: 'acc-1a2b3c4d', label: '小号', keyRef: 'OPENCODE_GO_USAGE_ACC_1A2B3C4D', keyHint: '…C3d4', isDefault: false, configured: true,
+  },
+]
+
+function buttonsOf(node) {
+  const buttons = []
+  walk(node, (element) => {
+    if (element !== null && element.type === 'button') buttons.push(element)
+  })
+  return buttons
+}
+
+function inputsOf(node) {
+  const inputs = []
+  walk(node, (element) => {
+    if (element !== null && element.type === 'input') inputs.push(element)
+  })
+  return inputs
+}
+
+test('readAccount + readAccounts: defensive shapes and a default fallback', () => {
+  const parsed = internals.readAccounts({ activeId: 'acc-1a2b3c4d', accounts: ACCOUNTS })
+  assert.equal(parsed.activeId, 'acc-1a2b3c4d')
+  assert.equal(parsed.accounts.length, 2)
+  assert.equal(parsed.accounts[1].label, '小号')
+  assert.equal(parsed.accounts[1].configured, true)
+
+  const fallback = internals.readAccounts({})
+  assert.equal(fallback.activeId, 'default')
+  assert.equal(fallback.accounts.length, 1)
+  assert.equal(fallback.accounts[0].isDefault, true)
+
+  const unknownActive = internals.readAccounts({ activeId: 'acc-deadbeef', accounts: ACCOUNTS })
+  assert.equal(unknownActive.activeId, 'default')
+
+  const account = internals.readAccount({ id: 'acc-1a2b3c4d', label: 'x', keyHint: '…C3d4', isDefault: false })
+  assert.equal(account.id, 'acc-1a2b3c4d')
+  assert.equal(account.keyHint, '…C3d4')
+  assert.equal(account.isDefault, false)
+})
+
+test('accountLabel: user label, localized default, then key hint', () => {
+  const zh = makeTranslator('zh')
+  const en = makeTranslator('en')
+  assert.equal(internals.accountLabel(ACCOUNTS[0], zh), '默认账号')
+  assert.equal(internals.accountLabel(ACCOUNTS[0], en), 'Default account')
+  assert.equal(internals.accountLabel(ACCOUNTS[1], zh), '小号')
+  assert.equal(
+    internals.accountLabel({ id: 'acc-1a2b3c4d', label: '', keyHint: '…C3d4', isDefault: false }, zh),
+    '账号 …C3d4',
+  )
+})
+
+test('accountErrorText: known codes are localized, unknown codes keep the host message', () => {
+  const zh = makeTranslator('zh')
+  assert.ok(internals.accountErrorText(zh, { code: 'duplicate-key' }).includes('已经加过'))
+  assert.ok(internals.accountErrorText(zh, { code: 'too-many-accounts' }).includes('8'))
+  assert.ok(internals.accountErrorText(zh, { code: 'default-key-managed' }).includes('DSH 凭据'))
+  assert.equal(internals.accountErrorText(zh, { code: 'weird', message: 'boom' }), 'boom')
+  assert.equal(internals.accountErrorText(zh, { code: 'weird' }), zh('account.error.generic'))
+})
+
+test('readSummary carries the account without any key material', () => {
+  const summary = internals.readSummary({
+    fetchedAt: 1,
+    account: { id: 'acc-1a2b3c4d', label: '小号', keyRef: 'REF', keyHint: '…C3d4', isDefault: false },
+    windows: {},
+    samples: [],
+  })
+  assert.equal(summary.account.id, 'acc-1a2b3c4d')
+  assert.equal(summary.account.label, '小号')
+  assert.equal(summary.account.keyHint, '…C3d4')
+  assert.equal(internals.readSummary({}).account.id, 'default')
+})
+
+test('AccountBar: one chip per account, active state and an add action', () => {
+  const t = makeTranslator('zh')
+  let selected = ''
+  let added = 0
+  let managed = 0
+  const tree = internals.AccountBar({
+    t,
+    accounts: ACCOUNTS,
+    activeId: 'acc-1a2b3c4d',
+    busyId: null,
+    panelOpen: false,
+    onSelect: (id) => { selected = id },
+    onAdd: () => { added += 1 },
+    onManage: () => { managed += 1 },
+  })
+  const chips = findByClass(tree, 'ogq-chip')
+  assert.equal(chips.length, 3)
+  assert.ok(chips[1].props.className.includes('is-active'))
+  assert.equal(chips[1].props['aria-selected'], 'true')
+  assert.ok(chips[1].props['aria-label'].includes('当前账号'))
+  assert.ok(chips[1].props['aria-label'].includes('…C3d4'))
+  chips[0].props.onClick()
+  assert.equal(selected, 'default')
+  chips[2].props.onClick()
+  assert.equal(added, 1)
+
+  const manage = findByClass(tree, 'ogq-manage')[0]
+  manage.props.onClick()
+  assert.equal(managed, 1)
+})
+
+test('AccountPanel list: rows, default protection and the add button', () => {
+  const t = makeTranslator('zh')
+  const tree = internals.AccountPanel({
+    t,
+    accounts: ACCOUNTS,
+    activeId: 'default',
+    panel: { mode: 'list' },
+    onClose: () => {},
+    onField: () => {},
+    onAdd: () => {},
+    onSubmit: () => {},
+    onCancel: () => {},
+    onRename: () => {},
+    onRotate: () => {},
+    onDelete: () => {},
+  })
+  assert.equal(findByClass(tree, 'ogq-accountrow').length, 2)
+  const text = textOf(tree).join(' ')
+  assert.ok(text.includes('默认'))
+  assert.ok(text.includes('小号'))
+  assert.ok(text.includes('添加账号'))
+
+  const buttons = buttonsOf(tree)
+  const rotate = buttons.find((button) => textOf(button).join('') === '换 Key' && button.props.disabled === true)
+  const remove = buttons.find((button) => textOf(button).join('') === '删除' && button.props.disabled === true)
+  assert.ok(rotate !== undefined, 'the default account cannot rotate its key')
+  assert.ok(remove !== undefined, 'the default account cannot be removed')
+})
+
+test('AccountPanel add form: password input, verification label and no key echo', () => {
+  const t = makeTranslator('zh')
+  const tree = internals.AccountPanel({
+    t,
+    accounts: ACCOUNTS,
+    activeId: 'default',
+    panel: { mode: 'add', label: '', key: '', busy: false },
+    onClose: () => {},
+    onField: () => {},
+    onAdd: () => {},
+    onSubmit: () => {},
+    onCancel: () => {},
+    onRename: () => {},
+    onRotate: () => {},
+    onDelete: () => {},
+  })
+  const password = inputsOf(tree).find((input) => input.props.type === 'password')
+  assert.ok(password !== undefined)
+  assert.equal(password.props.autoComplete, 'new-password')
+  const text = textOf(tree).join(' ')
+  assert.ok(text.includes('验证并添加'))
+  assert.ok(text.includes('只用于读取该账号的额度'))
+
+  const busyTree = internals.AccountPanel({
+    t,
+    accounts: ACCOUNTS,
+    activeId: 'default',
+    panel: { mode: 'add', label: '', key: 'oc_sk_secret_C3d4', busy: true },
+    onClose: () => {},
+    onField: () => {},
+    onAdd: () => {},
+    onSubmit: () => {},
+    onCancel: () => {},
+    onRename: () => {},
+    onRotate: () => {},
+    onDelete: () => {},
+  })
+  assert.ok(textOf(busyTree).join(' ').includes('正在验证'))
+  assert.ok(!textOf(busyTree).join(' ').includes('oc_sk_secret'))
+})
+
+test('AccountPanel delete form names the account and asks for confirmation', () => {
+  const t = makeTranslator('zh')
+  const tree = internals.AccountPanel({
+    t,
+    accounts: ACCOUNTS,
+    activeId: 'acc-1a2b3c4d',
+    panel: { mode: 'delete', targetId: 'acc-1a2b3c4d' },
+    onClose: () => {},
+    onField: () => {},
+    onAdd: () => {},
+    onSubmit: () => {},
+    onCancel: () => {},
+    onRename: () => {},
+    onRotate: () => {},
+    onDelete: () => {},
+  })
+  const text = textOf(tree).join(' ')
+  assert.ok(text.includes('小号'))
+  assert.ok(text.includes('确认删除'))
+  assert.ok(text.includes('本地采样'))
+})
+
+test('PAGE_CSS: account bar, chips, panel and form styles use the theme tokens', () => {
+  const css = internals.PAGE_CSS
+  for (const className of ['.ogq-accountbar', '.ogq-chip.is-active', '.ogq-accountpanel', '.ogq-input', '.ogq-btn-primary']) {
+    assert.ok(css.includes(className), 'missing ' + className)
+  }
+  assert.ok(css.includes('.ogq-chip.is-warn .ogq-chip-dot'))
+  assert.ok(css.includes('max-width:719.98px'))
+  assert.ok(!css.includes('position:fixed'))
 })

@@ -348,6 +348,8 @@ async function main() {
       { name: 'preview-light.png', width: 1440, height: 900, query: 'state=ready' },
       { name: 'preview-dark.png', width: 1440, height: 900, query: 'state=ready&dark=1' },
       { name: 'preview-narrow.png', width: 900, height: 700, query: 'state=ready' },
+      { name: 'preview-accounts.png', width: 1440, height: 900, query: 'state=ready&panel=list' },
+      { name: 'preview-account-add.png', width: 1440, height: 900, query: 'state=ready&panel=add&dark=1' },
     ]
 
     for (const shot of shots) {

@@ -10,7 +10,7 @@
 
 1. **插件整页**。不做侧栏卡片、不做浮窗/HUD、不注入宿主外壳 DOM、不改宿主主题 Token。侧栏只加一个入口行，点击进入 keyed `main` 页。
 2. **只用官方接口** `GET https://opencode.ai/zen/go/v1/usage`。不抓网页、不解析控制台 DOM、不做 token/成本/模型维度的估算。
-3. **复用 DSH 已有密钥**。密钥由 DSH credentials 保管（`OPENCODE_GO_API_KEY`），插件不新开密钥设置项、不写自己的密钥文件、不打印密钥。
+3. **密钥只放 DSH credentials**。默认账号复用 `OPENCODE_GO_API_KEY`；用户在页面里添加的账号由插件生成独立 ref，用 `credentials.set` 写进同一个 DSH 凭据库（`.credentials.yaml`）。插件不写自己的密钥文件、不打印密钥、不在页面显示完整 key；`accounts.json` 只存标签、id 与 ref。多账号切换只影响“看哪个号”，不改变 DSH 的路由配置。
 4. **本地采样**。官方接口只给瞬时百分比，所以由宿主半在本地落一份 7 天采样，用于绘制轨迹与节奏预测。采样是本插件**唯一的持久化状态**。
 5. **运行时零依赖**。不新增 `dependencies`；宿主半只用 Node 内置模块 + 全局 `fetch`，客户端半只 `require('react')`。
 6. **视觉对齐 Claude Code 桌面端主题**：暖米色表面、陶土橙强调、宋体界面、暖色深色版。
@@ -98,6 +98,22 @@ Accept: application/json
 
 `usageUrl` 推导：baseUrl 去掉尾部 `/` 后，若已以 `/zen/go/v1` 结尾 → `baseUrl + '/usage'`；否则 → `baseUrl + '/zen/go/v1/usage'`。`source.baseUrl` 存归一后（去尾斜杠）的值。
 
+### 4.1 多账号
+
+账号 = 一个 key 引用 + 一个标签，**不是** DSH provider。
+
+| id | label | key 来源 | 可换 Key | 可删 |
+|---|---|---|---|---|
+| `default` | `accounts.json.defaultLabel`（空则 UI 显示本地化「默认账号」） | §4 的解析链 | 否（去 DSH 凭据改 `OPENCODE_GO_API_KEY`） | 否 |
+| `acc-xxxxxxxx` | `accounts.json` 里的 label（空则 UI 显示「账号 …后4位」） | 插件生成的 ref → `credentials.resolve(ref)` → `process.env[ref]` | 是 | 是 |
+
+- 最多 **8** 个账号（含 default）。id 形如 `acc-[a-z0-9]{8}`，ref 形如 `OPENCODE_GO_USAGE_ACC_[A-Z0-9]{8}`。
+- key 规范化：trim → 去一个前导 `Bearer `（忽略大小写）→ 去 CR/LF → 拒绝任何空白 → 长度 8–512。
+- 新 key 与 default 或任何现有账号解析出的 key 相同 → `duplicate-key`，不写入。
+- 默认账号未配置且已有已配置的自定义账号时，初始 active 取第一个已配置账号；`summary` 不带 `accountId` 时也按这条走。
+- 自定义账号的 ref 被外部删掉 → 该账号 `configured:false`，页面显示 `no-key`，可换 Key 或删除。
+- 所有账号共用同一个 `baseUrl`（§4 的 baseURL 链），不做每账号 baseURL。
+
 ## 5. 插件 RPC
 
 宿主半注册一条 `POST /api/dsh-opencode-go-usage/call`，与 `dsh-token-usage` 同款信封：
@@ -119,12 +135,25 @@ connection.rpc.call(RPC_BASE, RPC_ENDPOINT, { endpoint, payload })
   "payload":{ "endpoint":"summary", "payload":{} } }
 ```
 
-端点两个：
+端点七个：
 
-- `summary` —— 返回当前 Summary（TTL 内命中内存缓存，不打上游）。
-- `refresh` —— **强制**打一次上游、把结果并入采样，然后返回**同一份 Summary 形状**（不是「仅触发」的空响应）。
+| endpoint | payload | 成功 value |
+|---|---|---|
+| `summary` | `{accountId?}` | Summary |
+| `refresh` | `{accountId?}` | Summary |
+| `accounts.list` | `{}` | `{activeId, accounts:[AccountInfo]}` |
+| `accounts.add` | `{label?, apiKey}` | `{accounts, activeId, summary, warning?}` |
+| `accounts.update` | `{id, label?, apiKey?}` | `{accounts, activeId, summary}` |
+| `accounts.remove` | `{id}` | `{accounts, activeId}` |
+| `accounts.activate` | `{id}` | `{accounts, activeId}` |
 
-两者的 `payload` 当前固定为 `{}`。必须容忍缺失、非对象、多余字段（未知参数忽略，不报错）。未知 `endpoint` → `ok:false, code:'unknown-endpoint'`。
+- `summary` / `refresh`：`accountId` 缺省时用当前 active；未知 id → `account-not-found`。`refresh` 永远绕过该账号的 TTL，但仍受 15s 超时与单飞约束。
+- `AccountInfo = { id, label, keyRef, keyHint, isDefault, configured }`；`activeId` 是 host 持久化的 active（见 §4.1 的回落规则）。
+- `accounts.add`：先校验 key、写凭据、写元数据，再用该 key 实时打一次上游。401/403 → 回滚（`unset` + 删元数据）并返回 `unauthorized`；`network`/`upstream` → 保留账号，`summary:null` 且带 `warning:{code,message}`。
+- `accounts.update`：`id=default` 时只接受 `label`；传 `apiKey` → `default-key-managed`。自定义账号换 Key 会清空该账号缓存与采样桶；校验 401 时恢复旧 key。
+- `accounts.remove`：删元数据、`unset` ref（best effort）、删采样桶；`id=default` → `cannot-remove-default`。
+- `accounts.activate`：只持久化 active，不触发取数；客户端随后自行调用 `summary`。
+- 所有 payload 必须容忍缺失、非对象、多余字段（未知参数忽略，不报错）。未知 `endpoint` → `ok:false, code:'unknown-endpoint'`。
 
 **响应（★ 已被运行期证伪一次，务必照此写）**：
 
@@ -152,6 +181,7 @@ connection.rpc.call(RPC_BASE, RPC_ENDPOINT, { endpoint, payload })
   stale: boolean,             // true = 本次取数失败，值是兜底旧数据
   error: { code: string, message: string } | null,   // null = 本次数据来自成功取数
   source: { baseUrl: string, usageUrl: string, keyRef: string, keyHint: string },
+  account: { id: string, label: string, keyRef: string, keyHint: string, isDefault: boolean },
   windows: {
     rolling: { key: 'rolling', label: '5h',      status: string, percent: number | null, resetAt: string, resetInSec: number },
     weekly:  { key: 'weekly',  label: 'weekly',  status: string, percent: number | null, resetAt: string, resetInSec: number },
@@ -166,6 +196,7 @@ connection.rpc.call(RPC_BASE, RPC_ENDPOINT, { endpoint, payload })
 
 - `fetchedAt` 只表示“这份数字是什么时候从上游拿到的”，不是响应生成时间（唯一例外：从未成功过）。
 - `label` 固定为 `'5h' | 'weekly' | 'monthly'`（单位语汇，**不翻译**，不随 locale 变）。中文说明由 UI 在 label 旁另加，不改契约值。
+- `account.label` 对 default 是 `accounts.json.defaultLabel`（可为空，UI 回退到本地化「默认账号」）；对自定义账号是用户填的标签（可为空，UI 回退到「账号 …后4位」）。`account` 里永远没有 key。
 - `resetInSec = max(0, round((Date.parse(resetAt) - now) / 1000))`；解析失败 → `0`。
 - `samples` / `sampledSince` 必须与 `windows` 同源（同一次成功取数才追加），不得为了“图好看”插值或补点。
 - 所有数字是真 `number`，不用字符串数字；未知一律 0 / `null`（UI 显示 `—`），绝不 NaN。
@@ -174,10 +205,10 @@ connection.rpc.call(RPC_BASE, RPC_ENDPOINT, { endpoint, payload })
 
 | 参数 | 值 | 含义 |
 |---|---|---|
-| 内存软 TTL | 30s | TTL 内 `summary` 回缓存，`cached:true, stale:false` |
-| `refresh` | 永远绕过 TTL | 但受 15s 超时与单飞约束 |
-| 兜底可用窗口 | 6h | 超过 6h 的旧值不再兜底 → `ok:false` |
-| 客户端轮询 | 60s | 页面挂载期间；页面不可见时暂停 |
+| 内存软 TTL | 30s | **按账号**：TTL 内 `summary` 回该账号缓存，`cached:true, stale:false` |
+| `refresh` | 永远绕过 TTL | 但受 15s 超时与单飞约束；只刷新请求的那个账号 |
+| 兜底可用窗口 | 6h | **按账号**：超过 6h 的旧值不再兜底 → `ok:false` |
+| 客户端轮询 | 60s | 只轮询当前 active 账号；页面不可见时暂停 |
 
 > 上表三个时限以当前实现为准，且必须与代码逐字一致：`lib/host.js` 的 `DEFAULT_CONFIG.cacheTtlMs = 30_000` / `timeoutMs = 15_000`，`lib/client.js` 的 `POLL_MS = 60_000`（对应界面副标「60 秒采样」），`scripts/probe-live.mjs` 的 `TIMEOUT_MS = 15_000`。轮询间隔大于软 TTL，所以每次轮询都会真正打一次上游；改任一处都必须同步改本表与 README。
 
@@ -193,6 +224,15 @@ connection.rpc.call(RPC_BASE, RPC_ENDPOINT, { endpoint, payload })
 | `bad-request` | 信封不合法（框架级） | 内部错误 |
 | `unknown-endpoint` | 未知 endpoint（框架级） | 内部错误 |
 | `host-unavailable` / `rpc-failed` | 客户端拿不到 `connection.rpc` 或传输失败 | 宿主半未加载 / 刷新重试 |
+| `invalid-key` | 添加/换 Key 时 key 为空、含空白、长度不在 8–512、或不是字符串 | 提示检查粘贴内容 |
+| `duplicate-key` | 新 key 与 default 或任一现有账号相同 | 提示这个号已经加过 |
+| `too-many-accounts` | 已有 8 个账号（含 default） | 提示先删一个 |
+| `key-store-unavailable` | `ctx.credentials.set` 不存在、抛错或服务不可用 | 提示 DSH 凭据服务不可用，未保存 |
+| `account-not-found` | 未知 / 已删除的 accountId | 刷新账号列表 |
+| `default-key-managed` | 试图给 default 换 key | 去 DSH 凭据改 `OPENCODE_GO_API_KEY` |
+| `cannot-remove-default` | 试图删除 default | 默认账号不能删 |
+| `account-store-failed` | `accounts.json` 写失败（凭据已回滚） | 提示重试 |
+| `account-changed` | 请求在途时该账号被换 Key / 删除，结果不再可信 | 自动重试；页面显示短暂错误 |
 
 `stale` 判定表（**照表实现，不要自行发挥**）：
 
@@ -209,14 +249,26 @@ connection.rpc.call(RPC_BASE, RPC_ENDPOINT, { endpoint, payload })
 ## 7. 本地采样
 
 - 路径：`<DSH_HOME>/opencode-go-usage/samples.json`，`DSH_HOME` 缺省 `~/.dsh`。
-- 文件形状：`{ "version": 1, "updatedAt": <ms>, "samples": [ {t, rolling, weekly, monthly} ] }`。
+- 文件形状（v2，按账号分桶）：
+
+```json
+{ "version": 2, "updatedAt": 1792570000000,
+  "accounts": {
+    "default": { "fingerprint": "a1b2c3d4e5f60718",
+                 "samples": [ { "t": 0, "rolling": 12, "weekly": 41, "monthly": 8 } ] }
+  } }
+```
+
+- v1 `{version:1, samples:[…]}` 或裸数组在加载时自动迁移到 `default` 桶，旧轨迹保留。
+- `fingerprint = sha256(apiKey).slice(0,16)`，只存在采样文件里，**不返回客户端、不进日志**。读取或追加时发现指纹与桶里记录的不同 → 清空该桶（默认账号在 DSH 里换 key、或外部改了 ref 时，轨迹不会串号）。
 - **只在成功取数、且三档 `percent` 都是有限数时写入**。失败或部分 200 不写 —— 否则会把旧值重复采样成一条平线，或给缺失档补一条假 0 线，污染节奏预测。
-- 去重：若最后一点与本次相差 `< 30_000ms` → **就地替换**最后一点；否则追加。这样短时间内连点刷新不会长出锯齿。
-- 裁剪：先丢 `t < now - 7*86400*1000`，再从头部丢到 ≤ **10080** 点（7 天 × 60s）。
+- 去重：若最后一点与本次相差 `< 30_000ms` → **就地替换**最后一点；否则追加。
+- 裁剪：每桶先丢 `t < now - 7*86400*1000`，再从头部丢到 ≤ **10080** 点（7 天 × 60s）。账号上限 8，总点数有界。
+- 删除账号或给它换 Key 时删掉该桶（`drop`），避免孤儿数据。
 - 写：best-effort 原子写（`mkdir -p` 目录 → 写 `samples.json.tmp.<pid>` → `renameSync`）。任何 IO 失败只写本地日志，**绝不影响 RPC 返回**。
-- 读：进程启动时容错解析；坏文件当空数组处理，并（best effort）覆盖为新文件；不因采样失败阻塞页面。
-- 进程内常驻一份内存副本，`summary` 不读盘。
-- 采样不做跨设备同步，也不进 DSH 的 session 日志。
+- 读：进程启动时容错解析；坏文件当空对象处理，并（best effort）覆盖为新文件；不因采样失败阻塞页面。
+- 进程内常驻内存副本；`summary` 只读当前账号的桶，不读盘。
+- 采样不做跨设备同步，也不进 DSH 的 session 日志。**非当前账号不采样**：轨迹与预测只在该账号被查看时增长。
 
 ## 8. 客户端注册契约
 
@@ -224,10 +276,15 @@ connection.rpc.call(RPC_BASE, RPC_ENDPOINT, { endpoint, payload })
 ctx.slots.inject('main', () => ctx.slots.register({
   name: 'main', key: PANEL_ID, locale: NS,
   inject: () => ({
-    requestSummary: () => callHost(ctx, 'summary', {}),
-    requestRefresh: () => callHost(ctx, 'refresh', {}),
+    requestSummary: (accountId) => callHost(ctx, 'summary', accountId ? { accountId } : {}),
+    requestRefresh: (accountId) => callHost(ctx, 'refresh', accountId ? { accountId } : {}),
+    requestAccounts: () => callHost(ctx, 'accounts.list', {}),
+    requestAddAccount: (input) => callHost(ctx, 'accounts.add', input),
+    requestUpdateAccount: (input) => callHost(ctx, 'accounts.update', input),
+    requestRemoveAccount: (id) => callHost(ctx, 'accounts.remove', { id }),
+    requestActivateAccount: (id) => callHost(ctx, 'accounts.activate', { id }),
   }),
-}, UsagePage))
+}, QuotaPage))
 
 ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
   name: 'sidebar.panellist', id: PANEL_ID, order: PANEL_ORDER, locale: NS,
@@ -286,11 +343,13 @@ window.__ModuleLoader__.load({
 布局（从上到下，最大宽约 1160px 居中，外层是一张 12px 圆角的「窗口」卡片）：
 
 1. **页头**：`OPENCODE GO` eyebrow + 标题「额度观测窗」+ 副标「官方 /zen/go/v1/usage · 60 秒采样」+ 状态徽标（实时/缓存/stale/加载）+ 最后取数时间（相对时间）+ 刷新按钮。
-2. **三档额度卡（左）**：三环嵌套的 240° 仪表（外环 monthly、中环 weekly、内环 rolling，起点 150° 顺时针 240°），24 个刻度；圆心只显示当前聚焦档的大字百分比（`clamp` 后绘制）、已用/未用与重置倒计时；弧按 `clamp(percent,0,100)` 画，>100 时该圈改为 `warn` 色（不额外叠环）。右侧三行真实按钮图例（迷你环 + 名称/说明 + 百分比 + 倒计时），默认聚焦已用最高的档。
-3. **节奏预测卡（右）**：用最近 24h 的采样斜率推「按当前速率，到重置时约 X%」，三档各一行，带分段进度条；至少需要 2 个采样且跨度 ≥ 1 小时，否则显示 `—` 与「采样不足，稍后自动更新」；外推 > 300% 时显示 `> 300%`。**必须**带「预测」字样与样本跨度/数量，不得描述成官方配额。
-4. **重置地平线（全宽）**：三条时间刻度尺（5h / 7d / 30d），填充表示窗口已过时间，指针在「现在」，右端是重置端帽 + 实时倒计时；最近的一档用 `accent` 高亮。这是时间轴，不是用量条，页头需注明「窗口进度按 5h / 7d / 30d 周期估算」。
-5. **采样轨迹（全宽）**：7 天、三档折线的零依赖 SVG，悬停点显示 `t` 与 percent；0 个样本显示「还没有采样」，1 个样本显示「采样不足」，不画假折线。
-6. **页脚**：`source.usageUrl`（只显示 host + path）+ `keyRef` + `keyHint` + 采样点数 + 实时/缓存 + 一句「数据来自 OpenCode Go 官方接口，仅供参考」。
+2. **账号栏（全宽）**：一排 chip（默认账号 + 每个自定义账号 + 「添加账号」），右侧「管理」。当前账号用 accent-soft 底 + accent 描边；未配置的 chip 带 warn 小点。窄屏横向滚动。**不做**总览条、不做并排仪表。
+3. **管理面板（账号栏下方内联展开）**：默认账号可改名（不可换 Key / 删除）；自定义账号可改名、换 Key、删除（行内二次确认）；底部是添加表单（标签可选 + key 密码框 + 验证并添加）。不用 `position:fixed` 遮罩。
+4. **三档额度卡（左）**：三环嵌套的 240° 仪表（外环 monthly、中环 weekly、内环 rolling，起点 150° 顺时针 240°），24 个刻度；圆心只显示当前聚焦档的大字百分比（`clamp` 后绘制）、已用/未用与重置倒计时；弧按 `clamp(percent,0,100)` 画，>100 时该圈改为 `warn` 色（不额外叠环）。右侧三行真实按钮图例（迷你环 + 名称/说明 + 百分比 + 倒计时），默认聚焦已用最高的档。
+5. **节奏预测卡（右）**：用最近 24h 的采样斜率推「按当前速率，到重置时约 X%」，三档各一行，带分段进度条；至少需要 2 个采样且跨度 ≥ 1 小时，否则显示 `—` 与「采样不足，稍后自动更新」；外推 > 300% 时显示 `> 300%`。**必须**带「预测」字样与样本跨度/数量，不得描述成官方配额。只使用当前账号的桶。
+6. **重置地平线（全宽）**：三条时间刻度尺（5h / 7d / 30d），填充表示窗口已过时间，指针在「现在」，右端是重置端帽 + 实时倒计时；最近的一档用 `accent` 高亮。这是时间轴，不是用量条，页头需注明「窗口进度按 5h / 7d / 30d 周期估算」。
+7. **采样轨迹（全宽）**：7 天、三档折线的零依赖 SVG，悬停点显示 `t` 与 percent；0 个样本显示「还没有采样」，1 个样本显示「采样不足」，不画假折线。只画当前账号的桶。
+8. **页脚**：`source.usageUrl`（只显示 host + path）+ 「账号标签 · keyHint」+ 采样点数 + 实时/缓存 + 一句「数据来自 OpenCode Go 官方接口，仅供参考」。
 
 禁忌：编造数值、显示完整密钥、用「剩余」措辞、把颜色字面量散落在组件里（统一走上面的 token 常量）、用 `position:fixed` 覆盖宿主外壳。
 
