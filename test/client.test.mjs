@@ -389,11 +389,13 @@ test('forecast: no samples or one sample means no projection, never a fake extra
 test('forecast: projected percent and ETA come from the recent sample slope', () => {
   const now = 1_700_000_000_000
   const hour = 3600_000
+  // resetInSec 10000 starts the cycle 8000 s ago, so all four samples sit
+  // inside the current 5h cycle (a rollover is tested separately below).
   const samples = [
-    { t: now - 3 * hour, rolling: 30, weekly: 10, monthly: 5 },
-    { t: now - 2 * hour, rolling: 33, weekly: 10, monthly: 5 },
-    { t: now - hour, rolling: 36, weekly: 10, monthly: 5 },
-    { t: now, rolling: 40, weekly: 10, monthly: 5 },
+    { t: now - 2 * hour, rolling: 31, weekly: 10, monthly: 5 },
+    { t: now - 1.5 * hour, rolling: 34, weekly: 10, monthly: 5 },
+    { t: now - hour, rolling: 37, weekly: 10, monthly: 5 },
+    { t: now - 0.5 * hour, rolling: 40, weekly: 10, monthly: 5 },
   ]
   const rising = internals.forecast({ key: 'rolling', percent: 40, resetInSec: 10000 }, {
     periodSec: 18000,
@@ -401,8 +403,8 @@ test('forecast: projected percent and ETA come from the recent sample slope', ()
     now,
   })
   assert.equal(rising.sampleCount, 4)
-  assert.equal(rising.sampleSpanSec, 10800)
-  assert.ok(rising.slopePerSec > 0.0008 && rising.slopePerSec < 0.001, String(rising.slopePerSec))
+  assert.equal(rising.sampleSpanSec, 5400)
+  assert.ok(Math.abs(rising.slopePerSec - 9 / 5400) < 1e-9, String(rising.slopePerSec))
   assert.ok(Math.abs(rising.projected - (40 + rising.slopePerSec * 10000)) < 1e-9)
   assert.ok(rising.projected > 40 && rising.projected < 100)
   assert.equal(rising.etaSec, null, 'it will not hit the cap before the reset')
@@ -536,6 +538,62 @@ test('forecast: sample window is the last 24 h and only the matching series is f
   })
   assert.equal(badPeriod.horizonKnown, false)
   assert.equal(badPeriod.projected, null)
+})
+
+test('forecast: a 5h reset inside the fit window does not project the drop-off', () => {
+  const now = 1_700_000_000_000
+  const minute = 60_000
+  // The 5h cycle reset 70 minutes ago (resetInSec = 18000 - 4200).
+  const resetInSec = 5 * 3600 - 70 * 60
+  const samples = [
+    { t: now - 240 * minute, rolling: 10, weekly: 20, monthly: 12 },
+    { t: now - 180 * minute, rolling: 14, weekly: 21, monthly: 12 },
+    { t: now - 120 * minute, rolling: 15, weekly: 22, monthly: 13 },
+    { t: now - 70 * minute, rolling: 0, weekly: 22, monthly: 13 }, // the reset
+    { t: now - 40 * minute, rolling: 2, weekly: 22, monthly: 13 },
+    { t: now - 20 * minute, rolling: 4, weekly: 23, monthly: 13 },
+    { t: now, rolling: 5, weekly: 23, monthly: 13 },
+  ]
+  const result = internals.forecast({ key: 'rolling', percent: 5, resetInSec }, {
+    periodSec: 5 * 3600,
+    samples,
+    now,
+  })
+  assert.equal(result.sampleCount, 4, 'only samples from the current cycle are fitted')
+  assert.equal(result.sampleSpanSec, 70 * 60)
+  assert.ok(result.slopePerSec > 0, 'the new cycle is rising, not draining')
+  assert.ok(result.projected > 5, 'never 0.0% right after a rollover: ' + result.projected)
+  assert.ok(result.projected < 100)
+  assert.ok(Math.abs(result.projected - (5 + result.slopePerSec * resetInSec)) < 1e-9)
+
+  // The weekly row keeps its own (much older) cycle: no 5h clip applies.
+  const weekly = internals.forecast({ key: 'weekly', percent: 23, resetInSec: 4 * 86400 }, {
+    periodSec: 7 * 86400,
+    samples,
+    now,
+  })
+  assert.equal(weekly.sampleCount, 7)
+  assert.equal(weekly.sampleSpanSec, 240 * 60)
+})
+
+test('forecast: a cycle that just reset has no pace to show yet', () => {
+  const now = 1_700_000_000_000
+  const minute = 60_000
+  const resetInSec = 5 * 3600 - 5 * 60 // the cycle started five minutes ago
+  const result = internals.forecast({ key: 'rolling', percent: 1, resetInSec }, {
+    periodSec: 5 * 3600,
+    samples: [
+      { t: now - 120 * minute, rolling: 12, weekly: 20, monthly: 12 },
+      { t: now - 60 * minute, rolling: 15, weekly: 20, monthly: 12 },
+    ],
+    now,
+  })
+  assert.equal(result.sampleCount, 0)
+  assert.equal(result.slopePerSec, null)
+  assert.equal(result.projected, null, 'no history in this cycle yet: show “—”, not a number')
+  assert.equal(result.known, false)
+  assert.equal(result.horizonKnown, true)
+  assert.equal(result.elapsedFrac, (18000 - resetInSec) / 18000)
 })
 
 test('sampleSlope: least squares in percent per second, degenerate input is null', () => {
@@ -854,7 +912,9 @@ test('ForecastCard: projects from the recent sample slope and states the real sa
   ]
   const card = internals.ForecastCard({ t, lang: 'zh', windows, samples, now })
   const texts = textOf(card)
-  assert.ok(texts.includes('≈ 49.2%'), texts.join('|'))
+  // resetInSec 10000 starts the 5h cycle 8000 s ago, so the 3 h-old sample is
+  // from the previous cycle and the 5h row fits the remaining three.
+  assert.ok(texts.includes('≈ 49.7%'), texts.join('|'))
   assert.ok(texts.some((text) => text.includes('4 个采样')), 'footnote names the sample count')
   assert.ok(texts.some((text) => text.includes('3 时')), 'footnote names the sample span')
   assert.equal(findByClass(card, 'ogq-fc-bar').length, 3)

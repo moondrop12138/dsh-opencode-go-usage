@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencode-go-usage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "OpenCode Go subscription usage page for the DSH Web UI: official 5h / weekly / monthly used-percent windows, reset countdowns, a local sampling trail, and multiple API-key accounts you can switch between",
   "type": "module",
