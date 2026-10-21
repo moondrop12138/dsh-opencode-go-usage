@@ -207,11 +207,28 @@ async function inspectPage(cdp) {
           const dial = document.querySelector('.ogq-dial')
           const legend = document.querySelector('.ogq-legend')
           const ruler = document.querySelector('.ogq-ruler')
+          const boxOf = (el) => {
+            if (el === null) return null
+            const r = el.getBoundingClientRect()
+            return { x: r.x, y: r.y, w: r.width, h: r.height }
+          }
+          const hits = (a, b) => a !== null && b !== null
+            && a.x < b.x + b.w - 1 && b.x < a.x + a.w - 1
+            && a.y < b.y + b.h - 1 && b.y < a.y + a.h - 1
+          const dialBox = boxOf(dial)
+          const legendBox = boxOf(legend)
+          const legs = Array.from(document.querySelectorAll('.ogq-leg')).map(boxOf)
+          let collisions = hits(dialBox, legendBox) ? 1 : 0
+          for (let index = 1; index < legs.length; index += 1) {
+            if (hits(legs[index - 1], legs[index])) collisions += 1
+          }
           return {
             gridColumns: grid === null ? null : count(getComputedStyle(grid).gridTemplateColumns),
-            dialWidth: dial === null ? null : Math.round(dial.getBoundingClientRect().width),
+            dialWidth: dial === null ? null : Math.round(dialBox.w),
             legendColumns: legend === null ? null : count(getComputedStyle(legend).gridTemplateColumns),
             rulerAreas: ruler === null ? null : getComputedStyle(ruler).gridTemplateAreas,
+            collisions,
+            pageWidth: page === null ? null : page.clientWidth,
           }
         })(),
         fonts: {
@@ -407,13 +424,20 @@ async function main() {
         (info.page ? `, scroll ${info.page.scrollHeight}/${info.page.clientHeight}` : ''))
     }
 
-    // Responsive contract probes (no screenshots): two columns at 1100,
-    // a 280px dial and vertical ruler rows below 720, no horizontal overflow.
+    // Responsive contract probes (no screenshots): two columns at 1100, a
+    // compact dial below 720, vertical ruler rows on a phone, no horizontal
+    // overflow and no dial/legend or legend-row overlap anywhere. The last
+    // probe emulates the host handing the page a narrow column inside a wide
+    // window, which only container queries can see.
     const probes = [
-      { name: 'wide-1100', width: 1100, height: 900, twoColumns: true },
+      // 1200 is the narrowest window that still gives the two-column layout:
+      // the breakpoint measures the page container (window minus its padding).
+      { name: 'wide-1200', width: 1200, height: 900, twoColumns: true },
       { name: 'wide-en-1440', width: 1440, height: 900, twoColumns: true, query: 'state=ready&lang=en' },
       { name: 'tablet-719', width: 719, height: 800, narrow: true },
-      { name: 'phone-480', width: 480, height: 844, narrow: true },
+      { name: 'phone-480', width: 480, height: 844, narrow: true, stackedRuler: true },
+      { name: 'panel-column-700', width: 1600, height: 1000, panel: 700, oneColumn: true },
+      { name: 'panel-column-980', width: 1600, height: 1000, panel: 980, oneColumn: true },
     ]
     for (const probe of probes) {
       await cdp.send('Emulation.setDeviceMetricsOverride', {
@@ -428,6 +452,12 @@ async function main() {
       await sleep(200)
       const state = await waitForReady(cdp, 15000)
       await sleep(400)
+      if (probe.panel) {
+        await cdp.send('Runtime.evaluate', {
+          expression: 'document.getElementById("root").style.maxWidth = "' + probe.panel + 'px"',
+        })
+        await sleep(350)
+      }
       const info = await inspectPage(cdp)
       const horizontalOverflow = []
       if (info.document && info.document.scrollWidth > info.document.clientWidth + 1) {
@@ -443,14 +473,20 @@ async function main() {
       if (probe.twoColumns && responsive.gridColumns !== 2) {
         report.problems.push(probe.name + ': expected 2 main columns, got ' + responsive.gridColumns)
       }
-      if (probe.narrow && (typeof responsive.dialWidth !== 'number' || responsive.dialWidth > 281)) {
-        report.problems.push(probe.name + ': expected a 280px dial, got ' + responsive.dialWidth)
+      if (probe.oneColumn && responsive.gridColumns !== 1) {
+        report.problems.push(probe.name + ': expected 1 main column in a narrow host column, got ' + responsive.gridColumns)
       }
-      if (probe.narrow && !String(responsive.rulerAreas || '').includes('track')) {
+      if (probe.narrow && (typeof responsive.dialWidth !== 'number' || responsive.dialWidth > 341)) {
+        report.problems.push(probe.name + ': expected a compact dial, got ' + responsive.dialWidth)
+      }
+      if (probe.stackedRuler && !String(responsive.rulerAreas || '').includes('track')) {
         report.problems.push(probe.name + ': ruler rows did not stack vertically (' + responsive.rulerAreas + ')')
       }
       if (probe.narrow && responsive.legendColumns !== 1) {
         report.problems.push(probe.name + ': expected a single-column legend, got ' + responsive.legendColumns)
+      }
+      if (responsive.collisions > 0) {
+        report.problems.push(probe.name + ': ' + responsive.collisions + ' layout collision(s) between the dial, legend or legend rows')
       }
       if (!info.ready) report.problems.push(probe.name + ': preview did not become ready')
       report.probes.push({

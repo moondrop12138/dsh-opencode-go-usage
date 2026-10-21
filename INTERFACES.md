@@ -353,6 +353,15 @@ window.__ModuleLoader__.load({
 
 禁忌：编造数值、显示完整密钥、用「剩余」措辞、把颜色字面量散落在组件里（统一走上面的 token 常量）、用 `position:fixed` 覆盖宿主外壳。
 
+**响应式必须用容器查询，不能用视口媒体查询。** 宿主给这个页面的列宽和窗口宽度不是一回事（侧栏、缩放、分屏、宿主的 slot 都能让页面比窗口窄很多）；用 `@media` 时窗口很宽、卡片已经很窄，二栏网格仍然开着，380px 的仪表会把 5h 图例挤成 0 宽，`nowrap` 的文字直接压到仪表上。所以：
+
+- `.ogq-page{container-type:inline-size;container-name:ogq-page}`，二栏/单栏由 `@container ogq-page (max-width:1099.98px)` 决定；
+- `.ogq-gaugecard` 是 `ogq-gauge` 容器：≤640px 仪表与图例改为上下堆叠（图例 3 列），≤520px 图例改单列；
+- `.ogq-horizon` 是 `ogq-horizon` 容器：≤560px 重置地平线改成「标题+倒计时一行、刻度尺一行」；
+- 兜底：`.ogq-gaugeinner` 允许 `flex-wrap`，`.ogq-legend` 有 `flex:1 1 240px` 与 `min-width:min(200px,100%)`，堆叠时用 `flex:0 0 auto`，任何尺寸都不许把图例压到 0 宽。
+
+验证：`tools/render-preview.mjs` 除了宽/平板/手机三种视口，还会在 1600 宽的视口里把页面列压到 700 / 980（`panel-column-*`），断言网格变单栏且 `collisions === 0`（仪表与图例、图例各行互不重叠）。
+
 ## 11. 验证命令
 
 ```bash

@@ -984,8 +984,14 @@ test('PAGE_CSS: themed tokens with warm fallbacks, dark + responsive + motion ru
     assert.ok(css.includes(fallback), 'missing fallback ' + fallback)
   }
   assert.ok(css.includes('body[data-ds-dark-theme] .ogq-page'))
-  assert.ok(css.includes('@media (max-width:1099.98px)'))
+  // Layout breakpoints follow the *container*, not the viewport: the host can
+  // give the panel a column much narrower than the window.
+  assert.ok(css.includes('container-type:inline-size'))
+  assert.ok(css.includes('@container ogq-page (max-width:1099.98px)'))
+  assert.ok(css.includes('@container ogq-gauge (max-width:640px)'))
+  assert.ok(css.includes('@container ogq-horizon (max-width:560px)'))
   assert.ok(css.includes('@media (max-width:719.98px)'))
+  assert.ok(!css.includes('@media (max-width:1099.98px)'), 'the two-column breakpoint must be container-based')
   assert.ok(css.includes('prefers-reduced-motion:reduce'))
   assert.ok(css.includes('font-variant-numeric:tabular-nums'))
   assert.ok(!css.includes('position:fixed'), 'the page must never cover the host shell')
